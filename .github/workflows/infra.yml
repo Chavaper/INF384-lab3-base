@@ -75,11 +75,18 @@ jobs:
   # Sustituir el paso centinela por la implementacion.
   politicas:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Sin implementar
-        run: |
-          echo "::error::El job 'politicas' no esta implementado."
-          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Analizar políticas Terraform
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          framework: terraform
+          output_format: cli
+          soft_fail: true
 
   # TODO
   # Calcular el plan, guardarlo en disco y exportarlo a tfplan.json.
