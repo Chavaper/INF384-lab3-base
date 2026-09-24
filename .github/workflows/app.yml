@@ -202,44 +202,108 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           jq -r '.results[] | "::warning file=\(.path),line=\(.start.line),title=\(.check_id | split(".") | last)::\(.extra.message | gsub("\n"; " "))"' semgrep.json
 
-  # TODO
   # Construir la imagen de la aplicacion y publicarla en el registro privado.
   #
-  # Depende de los cuatro jobs anteriores y corre solo desde la rama principal.
-  #
-  # La imagen se publica con tres tags independientes sobre el mismo manifiesto:
-  # el sha corto del commit, la version y el ambiente.
-  #
-  #   - El sha es el tag con el que se publica. Nace del commit, siempre
-  #     existe y no se reasigna nunca.
-  #   - La version identifica el artefacto para las personas y tampoco se
-  #     reasigna.
-  #   - El de ambiente se reasigna en cada publicacion y siempre apunta a lo
-  #     ultimo publicado para ese ambiente.
-  #
-  # Los dos ultimos se apuntan al manifiesto ya publicado. Agregar un tag a
-  # una imagen publicada no reenvia capas.
-  #
-  # La construccion es para linux/amd64 y declara el label
-  # org.opencontainers.image.title con el nombre de la aplicacion.
+  # Dos tags sobre el mismo manifiesto:
+  #   - sha (7 caracteres del commit): inmutable. Es el tag con el que se
+  #     construye y publica, y del que se lee el digest.
+  #   - prd: movil. Se reasigna en cada promocion y apunta a lo designado
+  #     para el ambiente. Se agrega sobre el manifiesto ya publicado, sin
+  #     reenviar capas.
   #
   # Condicion de detencion: cualquier fallo de construccion o de publicacion.
   #
-  # El job desplegar consume la salida 'digest' de este job. El formato es
-  # <registro>/<aplicacion>@sha256:... Exponer solo el sha del digest, o
-  # nombrar la salida de otra manera, rompe el despliegue.
-  #
-  # outputs:
-  #   digest: # TODO
-  #
-  # Sustituir el paso centinela por la implementacion.
+  # El job desplegar consume la salida 'digest' con el formato
+  # <registro>/<aplicacion>@sha256:...
   publicar:
+    needs: [calidad, secretos, dependencias, estatico]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      APP: inf384-lab3        # nombre de la aplicacion = repositorio en ECR
+      AMBIENTE: prd           # ambiente de la rama principal
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: Sin implementar
+      - uses: actions/checkout@v6
+
+      - name: Credenciales temporales
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Autenticar contra el registro
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Calcular el sha corto
+        run: echo "SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Construir la imagen
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
         run: |
-          echo "::error::El job 'publicar' no esta implementado."
-          exit 1
+          # --provenance/--sbom en false: Lambda solo acepta un manifiesto
+          # simple, no un indice con atestaciones.
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --label org.opencontainers.image.title="$APP" \
+            --tag "$REG/$APP:$SHA" \
+            .
+
+      - name: Publicar con el tag del sha y leer el digest
+        id: push
+        env:
+          REG: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -o pipefail
+          docker push "$REG/$APP:$SHA" | tee push.log
+          # El push termina con "<tag>: digest: sha256:... size: ..."
+          sum=$(grep -oE 'digest: sha256:[a-f0-9]{64}' push.log | tail -1 | cut -d' ' -f2)
+          if [ -z "$sum" ]; then
+            echo "::error::El push no devolvio un digest."
+            exit 1
+          fi
+          echo "SUM=$sum" >> "$GITHUB_ENV"
+          echo "digest=$REG/$APP@$sum" >> "$GITHUB_OUTPUT"
+
+      - name: Apuntar el tag del ambiente al mismo manifiesto
+        run: |
+          # Se copia el manifiesto ya publicado bajo el tag movil: no se
+          # reconstruye ni se reenvian capas.
+          manifest=$(aws ecr batch-get-image \
+            --repository-name "$APP" \
+            --image-ids imageDigest="$SUM" \
+            --query 'images[0].imageManifest' --output text)
+          media=$(aws ecr batch-get-image \
+            --repository-name "$APP" \
+            --image-ids imageDigest="$SUM" \
+            --query 'images[0].imageManifestMediaType' --output text)
+          if ! out=$(aws ecr put-image \
+                --repository-name "$APP" \
+                --image-tag "$AMBIENTE" \
+                --image-manifest "$manifest" \
+                --image-manifest-media-type "$media" 2>&1); then
+            # Si el tag ya apunta a este manifiesto (re-ejecucion), no es error.
+            echo "$out" | grep -q ImageAlreadyExistsException || { echo "$out"; exit 1; }
+          fi
+
+      - name: Resumen de la publicacion
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## Imagen publicada"
+            echo "| Referencia | Valor |"
+            echo "|---|---|"
+            echo "| Tag inmutable (commit) | \`$SHA\` |"
+            echo "| Tag de ambiente | \`$AMBIENTE\` |"
+            echo "| Digest desplegado | \`$DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Este job viene completo y no se modifica.
   # Las estrategias de despliegue y la verificacion posterior son contenido
