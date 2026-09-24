@@ -1,0 +1,15 @@
+# Excluir todo por defecto
+*
+
+# Permitir los archivos necesarios para instalar dependencias
+!package.json
+!package-lock.json
+
+# Permitir el código fuente
+!src/
+!src/**
+
+# Excluir archivos de pruebas que no se necesitan en producción
+src/**/*.test.js
+src/**/*.spec.js
+src/**/__tests__/
