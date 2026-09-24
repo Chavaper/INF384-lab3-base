@@ -14,6 +14,10 @@ on:
       - 'infra/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
 
   # TODO
@@ -118,10 +122,100 @@ jobs:
   plan:
     needs: [validar, politicas]
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+
     steps:
-      - name: Sin implementar
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Inicializar Terraform
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Calcular plan
+        run: terraform plan -out=tfplan
+
+      - name: Exportar plan JSON
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Exportar plan legible
+        run: terraform show tfplan > tfplan.txt
+
+      - name: Publicar plan en Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const plan = fs.readFileSync('infra/tfplan.txt', 'utf8');
+
+            const maxLength = 60000;
+            const contenido = plan.length > maxLength
+              ? plan.substring(0, maxLength) + '\n\n... Plan truncado por limite de GitHub ...'
+              : plan;
+
+            const body = [
+              '## Terraform Plan',
+              '',
+              '```terraform',
+              contenido,
+              '```'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Detectar destrucciones
+        id: destrucciones
+        shell: bash
         run: |
-          echo "::error::El job 'plan' no esta implementado."
+          if jq -e '
+            [.resource_changes[]?.change.actions[]? |
+             select(. == "delete")] |
+            length > 0
+          ' tfplan.json > /dev/null; then
+            echo "destruccion=true" >> "$GITHUB_OUTPUT"
+            echo "::error::El plan contiene al menos una accion de destruccion."
+            jq -r '
+              .resource_changes[]?
+              | select(.change.actions | index("delete"))
+              | "\(.address): \(.change.actions | join(", "))"
+            ' tfplan.json
+          else
+            echo "destruccion=false" >> "$GITHUB_OUTPUT"
+            echo "El plan no contiene acciones de destruccion."
+          fi
+
+      - name: Publicar artifacts del plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            infra/tfplan
+            infra/tfplan.json
+            infra/tfplan.txt
+
+      - name: Bloquear destruccion
+        if: steps.destrucciones.outputs.destruccion == 'true'
+        run: |
+          echo "::error::El plan contiene destrucciones y no tiene autorizacion humana."
           exit 1
 
   # TODO
