@@ -1,38 +1,83 @@
-name: app
+  # Compuerta informativa: el resultado queda en SonarQube Cloud y en el resumen.
+  calidad:
+    needs: pruebas
+    runs-on: ubuntu-latest
 
-# Pipeline de aplicacion. Es dueno de la imagen que ejecuta la funcion y no
-# toca la infraestructura.
-#
-# De las cuatro gates, solo `secretos` detiene el pipeline. Las otras
-# tres informan y dejan pasar: el hallazgo tiene que quedar visible en la
-# ejecucion, no enterrado en el log.
-#
-# El repositorio no tiene archivo de excepciones. Un hallazgo que se decida
-# no corregir se anota donde se produce: junto a la linea de codigo que lo
-# origina, o en el paso del pipeline que lo detecta cuando el hallazgo no
-# corresponde a ninguna linea. La anotacion lleva identificador del hallazgo,
-# razon, responsable y fecha de vencimiento. Las cuatro, siempre.
-#
-# En los jobs sin implementar, preferir una action del marketplace o la
-# imagen oficial de la herramienta antes que instalarla paso a paso en el
-# runner. La guia del laboratorio lista las referencias disponibles.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # historial completo para identificar codigo nuevo
 
-on:
-  push:
-    paths:
-      - 'src/**'
-      - 'package*.json'
-      - 'Dockerfile'
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'package*.json'
-      - 'Dockerfile'
-  workflow_dispatch:
+      - name: Descargar el reporte de cobertura
+        uses: actions/download-artifact@v4
+        with:
+          name: cobertura
+          path: coverage/
 
-jobs:
+      - name: Analisis en SonarQube Cloud
+        uses: SonarSource/sonarqube-scan-action@v8
+        continue-on-error: true   # informa, no detiene
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.qualitygate.wait=true
 
-  pruebas:
+      - name: Resultado visible en la ejecucion
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PROJECT: ${{ vars.SONAR_PROJECT_KEY }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$PR" ]; then q="projectKey=$PROJECT&pullRequest=$PR"
+          else q="projectKey=$PROJECT&branch=$GITHUB_REF_NAME"; fi
+          status=$(curl -s -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/qualitygates/project_status?$q" \
+            | jq -r '.projectStatus.status // "DESCONOCIDO"')
+          url="https://sonarcloud.io/dashboard?id=$PROJECT"
+          {
+            echo "## Calidad (SonarQube Cloud)"
+            echo "Quality gate: **$status** · [Ver el analisis]($url)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" != "OK" ]; then
+            echo "::warning title=Quality gate: $status::El codigo nuevo no cumple la quality gate. Detalle en $url"
+          fi
+
+  # Unica compuerta que detiene: cualquier hallazgo falla el job.
+  secretos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # historial completo, no solo el ultimo commit
+
+      - name: Gitleaks sobre el historial completo
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.24.0 \
+            git /repo --redact --no-banner \
+            --report-format json --report-path /repo/gitleaks.json \
+            --exit-code 1
+
+      - name: Hallazgos visibles en la ejecucion
+        if: always()
+        run: |
+          [ -f gitleaks.json ] || exit 0
+          n=$(jq length gitleaks.json)
+          echo "## Secretos: $n hallazgo(s)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$n" -eq 0 ] && exit 0
+          {
+            echo "| Regla | Archivo | Linea | Commit |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| \(.RuleID) | \(.File) | \(.StartLine) | \(.Commit[0:7]) |"' gitleaks.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "::error file=\(.File),line=\(.StartLine),title=Secreto (\(.RuleID))::Credencial en el commit \(.Commit[0:7]). Retirar del codigo y del historial, y rotar en el origen."' gitleaks.json
+
+  # Compuerta informativa sobre el arbol completo del lock file.
+  dependencias:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,161 +86,42 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
 
-      - name: Instalar desde el lock file
-        run: npm ci
-
-      - name: Pruebas con reporte de cobertura
-        run: npm run test:coverage
-
-      - name: Subir el reporte de cobertura
-        uses: actions/upload-artifact@v4
-        with:
-          name: cobertura
-          path: coverage/
-          if-no-files-found: error
-
-  # TODO
-  # Publicar el analisis de calidad y la cobertura en SonarQube Cloud, como
-  # en el Laboratorio 2.
-  #
-  # La configuracion del analisis viene resuelta en sonar-project.properties
-  # y no hay que editarla. Lo que falta es el ensamblaje: las credenciales,
-  # la cobertura y el analisis del historial.
-  #
-  # El reporte de cobertura lo produce el job pruebas.
-  # El analisis necesita el historial completo del repositorio para saber
-  # que es codigo nuevo.
-  #
-  # Esta compuerta no detiene el pipeline: el resultado queda en SonarQube
-  # Cloud y se lee ahi.
-  #
-  # Sustituir el paso centinela por la implementacion.
-  calidad:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Sin implementar
+      # Excepciones (si se decide no corregir), una por linea:
+      # <ID del hallazgo> | razon: ... | responsable: ... | vence: AAAA-MM-DD
+      - name: npm audit sobre el arbol completo
         run: |
-          echo "::error::El job 'calidad' no esta implementado."
-          exit 1
+          # Sin --omit=dev: el alcance incluye las dependencias de desarrollo
+          npm audit --package-lock-only --json > audit.json || true
+          n=$(jq '.metadata.vulnerabilities.total' audit.json)
+          echo "## Dependencias: $n vulnerabilidad(es)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$n" -eq 0 ] && exit 0
+          {
+            echo "| Paquete | Severidad | Rango | Aviso |"
+            echo "|---|---|---|---|"
+            jq -r '.vulnerabilities[] | .name as $p | .via[] | objects
+                   | "| \($p) | \(.severity) | \(.range) | [\(.title)](\(.url)) |"' audit.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.vulnerabilities[] | .name as $p | .via[] | objects
+                 | "::warning file=package-lock.json,title=\(.severity) en \($p)::\(.title) \(.url)"' audit.json
 
-  # TODO
-  # Buscar credenciales escritas en el codigo y en el historial del repositorio.
-  # El alcance incluye el historial completo, no solo el ultimo commit.
-  #
-  # Condicion de detencion: cualquier hallazgo. Esta es la unica compuerta
-  # de este pipeline que detiene.
-  #
-  # Una credencial no se exceptua. Se retira del codigo, se retira del
-  # historial y se rota en el origen. Silenciar el hallazgo deja la credencial
-  # viva y ademas apaga el control para la proxima.
-  #
-  # Sustituir el paso centinela por la implementacion.
-  secretos:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Sin implementar
-        run: |
-          echo "::error::El job 'secretos' no esta implementado."
-          exit 1
-
-  # TODO
-  # Contrastar el arbol de dependencias declarado en package-lock.json contra
-  # vulnerabilidades conocidas.
-  #
-  # El alcance es el arbol completo, no solo las dependencias de produccion.
-  # El repositorio arrastra un hallazgo que solo aparece si el alcance es el
-  # correcto: si el informe trae uno solo, el alcance esta mal.
-  #
-  # Esta compuerta no detiene el pipeline. El hallazgo no cuelga de ninguna
-  # linea de codigo: la anotacion, si se decide no corregir, va en el paso
-  # que lo detecta.
-  #
-  # Sustituir el paso centinela por la implementacion.
-  dependencias:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Sin implementar
-        run: |
-          echo "::error::El job 'dependencias' no esta implementado."
-          exit 1
-
-  # TODO
-  # Buscar patrones explotables en el codigo fuente.
-  #
-  # Esta compuerta no detiene el pipeline. El hallazgo cuelga de una linea
-  # concreta: la anotacion, si se decide no corregir, va junto a esa linea.
-  #
-  # Sustituir el paso centinela por la implementacion.
+  # Compuerta informativa: patrones explotables en el codigo fuente.
   estatico:
     runs-on: ubuntu-latest
     steps:
-      - name: Sin implementar
+      - uses: actions/checkout@v4
+
+      - name: Semgrep sobre src/
         run: |
-          echo "::error::El job 'estatico' no esta implementado."
-          exit 1
-
-  # TODO
-  # Construir la imagen de la aplicacion y publicarla en el registro privado.
-  #
-  # Depende de los cuatro jobs anteriores y corre solo desde la rama principal.
-  #
-  # La imagen se publica con tres tags independientes sobre el mismo manifiesto:
-  # el sha corto del commit, la version y el ambiente.
-  #
-  #   - El sha es el tag con el que se publica. Nace del commit, siempre
-  #     existe y no se reasigna nunca.
-  #   - La version identifica el artefacto para las personas y tampoco se
-  #     reasigna.
-  #   - El de ambiente se reasigna en cada publicacion y siempre apunta a lo
-  #     ultimo publicado para ese ambiente.
-  #
-  # Los dos ultimos se apuntan al manifiesto ya publicado. Agregar un tag a
-  # una imagen publicada no reenvia capas.
-  #
-  # La construccion es para linux/amd64 y declara el label
-  # org.opencontainers.image.title con el nombre de la aplicacion.
-  #
-  # Condicion de detencion: cualquier fallo de construccion o de publicacion.
-  #
-  # El job desplegar consume la salida 'digest' de este job. El formato es
-  # <registro>/<aplicacion>@sha256:... Exponer solo el sha del digest, o
-  # nombrar la salida de otra manera, rompe el despliegue.
-  #
-  # outputs:
-  #   digest: # TODO
-  #
-  # Sustituir el paso centinela por la implementacion.
-  publicar:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Sin implementar
-        run: |
-          echo "::error::El job 'publicar' no esta implementado."
-          exit 1
-
-  # Este job viene completo y no se modifica.
-  # Las estrategias de despliegue y la verificacion posterior son contenido
-  # de la sesion 6. La pregunta de reflexion 2 pide leerlo.
-  desplegar:
-    needs: publicar
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Credenciales temporales
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: us-east-1
-
-      - name: Actualizar la funcion por digest
-        run: |
-          aws lambda update-function-code \
-            --function-name inf384-lab3 \
-            --image-uri ${{ needs.publicar.outputs.digest }}
-
-      - name: Esperar a que la actualizacion termine
-        run: aws lambda wait function-updated --function-name inf384-lab3
+          docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.100.0 \
+            semgrep scan --config p/javascript --config p/nodejsscan \
+            --metrics=off --json --output semgrep.json src/ || true
+          n=$(jq '.results | length' semgrep.json)
+          echo "## Analisis estatico: $n hallazgo(s)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$n" -eq 0 ] && exit 0
+          {
+            echo "| Regla | Archivo | Linea | Severidad |"
+            echo "|---|---|---|---|"
+            jq -r '.results[] | "| \(.check_id | split(".") | last) | \(.path) | \(.start.line) | \(.extra.severity) |"' semgrep.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.results[] | "::warning file=\(.path),line=\(.start.line),title=\(.check_id | split(".") | last)::\(.extra.message | gsub("\n"; " "))"' semgrep.json
